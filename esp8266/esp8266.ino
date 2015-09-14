@@ -1,11 +1,14 @@
 /*
   SIK Guild Room's Coffee Scale - ESP8266 Code
 
-  Ircbot + updates current coffee amount to sika.hut.fi.
+  Ircbot + updates current coffee amount to elepaja.aalto.fi.
 
   Initial code by Temez 2015
 
   "Purkkaahan se on, mut jos se toimii, niin eikös se riitä?" -Temez
+
+  Build tools etc for Arduino IDE https://github.com/esp8266/Arduino
+  Boards manager link: http://arduino.esp8266.com/stable/package_esp8266com_index.json
   
  */
  
@@ -28,29 +31,34 @@
 IPAddress timeServer(193, 166, 5, 177); // time.nist.gov NTP server
 byte packetBuffer[NTP_PACKET_SIZE]; //48 = NTP packet size
 
+//WLAN SSID (and password)
 const char* ssid     = "aalto open";
 const char* password = "";
 
+//IRC related variables
 const char* host = "irc.cs.hut.fi";
 const String nick  = "CoffeeBot";
 const String defaultChannel = "#coffeebot";
 String nickplus = "";
 const int port = 6667;
 
-const char* wwwserver = "sika.hut.fi"; 
+const char* wwwserver = "elepaja.aalto.fi"; 
 
+//Variables related to weight, calibration and etc.
 unsigned int temp = 0, temp1 = 0, weight = 0, minimumWeight = -1, coffeePot = 0, maxTemp = 0;
 uint8_t buttons = 0;
 float cups = 0;
 boolean updateNeeded = false;
+time_t lastBrewTime = 0;
 
 WiFiUDP Udp;
 WiFiClient client;
 WiFiClient wwwclient;
 Ticker timeupdateTicker;
 Ticker updatewwwTicker;
-Ticker oldcoffeeTicker;
+Ticker cupsTicker;
 
+//Start Wlan connection and initialize Tickers
 void setup() {
   Serial.begin(9600);
   delay(10);
@@ -68,7 +76,7 @@ void setup() {
   fetchTime();
   timeupdateTicker.attach(87600, fetchTime); //Update time every day
   updatewwwTicker.attach(60, requestUpdate);
-  Serial.println("ready");
+  updatewwwTicker.attach(1, cupsUpdater);
 }
 
 //Ticker calls this function on 60 second intervals. Turns on updateNeeded flag which is checked at the end of the main loop.
@@ -78,16 +86,44 @@ void requestUpdate(){
   EEPROM.commit();
 }
 
+
+
+//This function is called every second. It is used to check if amount of cups should be updated.
+void cupsUpdater(){
+  static uint8_t cupsCounter = 0; //How many seconds weight has been stable?
+  static uint32_t prevWeight = 0;
+  
+  //If the value of weight has been fairly stable during last 5 seconds and we have 
+  if(cupsCounter > 5){
+    if((weight -coffeePot) > minimumWeight)
+      cups = (weight - minimumWeight - coffeePot)/10; //TODO: Change divider
+  }
+
+  //Value of weight must be 'stable' for 5 seconds
+  if(weight < 1.025*prevWeight && weight > 0.975*prevWeight)
+    cupsCounter++;
+  else
+    cupsCounter = 0;
+
+  //Save weight for future use
+  prevWeight = weight;
+}
+
 //Main loop. 
 void loop() {
+  //Read IO data from serial
+  readSerial();
+    
+  //If we havent connected and can't reconnect -> return
   if (!client.connected() && !connect())
     return;
-    
-  while(client.available()){
+
+  //Process messages from irc server
+  while(client.available())
     processLine(client.readStringUntil('\r'));
-  }
-  readSerial();
+
 #ifdef UPDATETOSERVER
+  //If updateNeeded flag is set by Ticker -> we need to contact webserver
   if(updateNeeded)
     updateValuesToServer();
 #endif
@@ -96,7 +132,7 @@ void loop() {
 //This function updates values to the server
 void updateValuesToServer(){
     if (wwwclient.connect(wwwserver, 80)) {
-      wwwclient.println("GET /update?weight=" + String(weight) + "&temp=" + String(temp) +  " HTTP/1.0"); //TODO: Change address type?
+      wwwclient.println("GET /kahvi/update.php?weight=" + String(weight) + "&temp=" + String(temp) +  " HTTP/1.0"); //TODO: Change address type?
       wwwclient.println();
       unsigned long starttime = millis();
       while (millis() - starttime < 5000)
@@ -108,18 +144,18 @@ void updateValuesToServer(){
         }
       }
     }
+    //Clear flag
     updateNeeded = false;
 }
 
 //Processes all incoming messages
 void processLine(String line){
-    int channelIdx = line.indexOf("PRIVMSG");
     
-
     if(line.startsWith("PING")){
       line[1] = 'O';
       client.println(line);
     }else if(line.indexOf("PRIVMSG") != -1){
+      int channelIdx = line.indexOf("PRIVMSG"); //Or actually this +8 chars
       int messageIdx = line.indexOf(':', 1)+1;
       int channelIdxEnd = line.indexOf(' ', channelIdx+8);
       int senderIdxEnd = line.indexOf('!');
@@ -133,8 +169,14 @@ void processLine(String line){
         sprintf(timeNow, "%04d-%02d-%02d %02d:%02d", year(), month(), day(), hour(), minute());
         client.println("PRIVMSG " + channel + " :Aika on: " + timeNow);
       }
-      else if(line.indexOf(".k",messageIdx) != -1 || line.indexOf(".kahvi",messageIdx) != -1 || line.indexOf(".coffee",messageIdx) != -1)
-        client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä.");
+      else if(line.indexOf(".k",messageIdx) != -1 || line.indexOf(".kahvi",messageIdx) != -1 || line.indexOf(".coffee",messageIdx) != -1){
+        String tmp = "";
+        if(!lastBrewTime)
+          tmp = "Kahvia ei ole keitetty edellisen rebootin jälkeen.";
+        else
+          tmp = "Keitetty " + String((now()-lastBrewTime)/60) + " minuuttia sitten.";
+        client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
+      }
     }
 }
 
@@ -143,7 +185,7 @@ void fetchTime(){
   Udp.begin(NTP_PORT);
   sendNTPpacket(timeServer);
 
-  long starttime = millis();
+  unsigned long starttime = millis();
   while (millis() - starttime < 10000) {
     if ( Udp.parsePacket() ) {     // We've received a packet, read the data from it
       Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
@@ -206,7 +248,7 @@ enum coffeeState {
 } state;
 
 //Will be used for retrieving info from IO
-//TODO: Check order of the data.
+//TODO: Mapping to human readable values?
 char c,c1,c2;
 void readSerial(){
   while(Serial.available()){
@@ -216,32 +258,29 @@ void readSerial(){
       buttons = Serial.read();
       weight = read32();
       temp = read32();
-      if(temp > 80 && state == IDLE){ //TODO: Adjust temperature limit
+      if(temp <  300000 && state == IDLE){ //TODO: Adjust temperature limit (value gets smaller when higher temp)
         client.println("PRIVMSG " + defaultChannel + " :Kahvi keittyy nyt!");
+        if(weight > minimumWeight*1.5) //We can presume that the coffee pot is at correct place at this stage
+          coffeePot = weight;
         state = BREWING;
-      }else if(temp < 40 && state == BREWING){ //TODO: Adjust temperature limit
+      }else if(temp > 320000 && state == BREWING){ //TODO: Adjust temperature limit (value gets bigger when lower temp)
         client.println("PRIVMSG " + defaultChannel + " :Kahvi valmis!");
+        lastBrewTime = now();
         state = IDLE;
       }
       temp1 = read32();
       
       if(weight < minimumWeight)
         minimumWeight = weight;
-      if(temp > maxTemp)
+      if(temp < maxTemp) //Max temp will be around 76-80 celcius -> this is used for calibration (we don't need exact temperature, value gets smaller when higher temp)
         maxTemp = temp;
-      if(buttons & BUTTON1_MASK && buttons & BUTTON2_MASK){
-        coffeePot = weight;
-        EEPROM.write(0, coffeePot);
-      }
-      cups = (weight - minimumWeight - coffeePot)/10; //TODO: Measure coffeePot (or do calibration) and change divider
-      cups = weight;
     }
     c2 = c1;
     c1 = c;
   }
 }
 
-//Following two functions
+//Following two functions handle NTP and DST related things
 unsigned long sendNTPpacket(IPAddress& address)
 {
   // set all bytes in the buffer to 0
