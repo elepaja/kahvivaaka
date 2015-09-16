@@ -21,7 +21,14 @@
 #include <Ticker.h>
 #include <EEPROM.h>
 
-//#define UPDATETOSERVER
+#define UPDATETOSERVER
+#define UPDATE_INTERVAL 30
+//#define DEBUG
+
+
+#ifdef DEBUG
+#define UPDATE_INTERVAL 5
+#endif
 
 #define NTP_PORT 8888
 #define NTP_PACKET_SIZE 48
@@ -33,22 +40,24 @@ byte packetBuffer[NTP_PACKET_SIZE]; //48 = NTP packet size
 
 //WLAN SSID (and password)
 const char* ssid     = "aalto open";
-const char* password = "";
+//const char* password = "sikelepaja";
 
 //IRC related variables
 const char* host = "irc.cs.hut.fi";
 const String nick  = "CoffeeBot";
-const String defaultChannel = "#coffeebot";
+const String defaultChannel = "#sik_ry";
+const String debugChannel = "#coffeebot";
 String nickplus = "";
 const int port = 6667;
 
 const char* wwwserver = "elepaja.aalto.fi"; 
 
 //Variables related to weight, calibration and etc.
-unsigned int temp = 0, temp1 = 0, weight = 0, minimumWeight = -1, coffeePot = 0, maxTemp = 0;
-uint8_t buttons = 0;
+uint32_t temp1 = 0, weight = 0, coffeePot = 413267;
+uint8_t buttons = 0, temp = 0;
 float cups = 0;
-boolean updateNeeded = false;
+volatile boolean updateNeeded = false;
+boolean debug = false;
 time_t lastBrewTime = 0;
 
 WiFiUDP Udp;
@@ -63,11 +72,7 @@ void setup() {
   Serial.begin(9600);
   delay(10);
 
-  EEPROM.begin(4);
-  coffeePot = EEPROM.read(0);
-
   WiFi.begin(ssid);
-  //WiFi.begin(ssid, password);
   
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
@@ -75,38 +80,42 @@ void setup() {
 
   fetchTime();
   timeupdateTicker.attach(87600, fetchTime); //Update time every day
-  updatewwwTicker.attach(60, requestUpdate);
-  updatewwwTicker.attach(1, cupsUpdater);
+  
+  updatewwwTicker.attach(UPDATE_INTERVAL, requestUpdate);
+  cupsTicker.attach(1, cupsUpdater);
 }
 
 //Ticker calls this function on 60 second intervals. Turns on updateNeeded flag which is checked at the end of the main loop.
 //Also writes EEPROM to flash from RAM
 void requestUpdate(){
   updateNeeded = true;
-  EEPROM.commit();
 }
 
 
 
 //This function is called every second. It is used to check if amount of cups should be updated.
 void cupsUpdater(){
-  static uint8_t cupsCounter = 0; //How many seconds weight has been stable?
+  static uint16_t cupsCounter = 0; //How many seconds weight has been stable?
   static uint32_t prevWeight = 0;
   
-  //If the value of weight has been fairly stable during last 5 seconds and we have 
-  if(cupsCounter > 5){
-    if((weight -coffeePot) > minimumWeight)
-      cups = (weight - minimumWeight - coffeePot)/10; //TODO: Change divider
-  }
-
   //Value of weight must be 'stable' for 5 seconds
-  if(weight < 1.025*prevWeight && weight > 0.975*prevWeight)
+  if(weight < prevWeight + 3600 && weight > prevWeight - 3600) // 3600 is about 25grams
     cupsCounter++;
-  else
+  else{
     cupsCounter = 0;
-
-  //Save weight for future use
-  prevWeight = weight;
+    //Save weight for future usei 
+    prevWeight = weight;
+  }
+  
+  //If the value of weight has been fairly stable during last 5 seconds
+  if(cupsCounter > 5){
+    if(weight > 0.9*coffeePot) //coffeePot placed on the scale
+      cups = ((int)(weight - coffeePot))/18263.0;
+    else if(cupsCounter > 180) //Pot was away over 180 seconds. Let's presume that it is too dirty to be used :P
+      cups = 0;
+    if(cups < 0.5) //Small amounts are irrelevant :P -Temez
+      cups = 0;
+  }
 }
 
 //Main loop. 
@@ -120,22 +129,27 @@ void loop() {
 
   //Process messages from irc server
   while(client.available())
-    processLine(client.readStringUntil('\r'));
+    processLine(client.readStringUntil('\n'));
 
-#ifdef UPDATETOSERVER
   //If updateNeeded flag is set by Ticker -> we need to contact webserver
-  if(updateNeeded)
-    updateValuesToServer();
-#endif
+  if(updateNeeded){
+    if(debug)
+      client.println("PRIVMSG " + debugChannel + " :Cups: " + String(cups) + " Weight: " + String(weight) + " Temp: " + String(temp) );
+    #ifdef UPDATETOSERVER
+      updateValuesToServer();
+    #endif
+    updateNeeded = false;
+  }
 }
 
 //This function updates values to the server
 void updateValuesToServer(){
     if (wwwclient.connect(wwwserver, 80)) {
-      wwwclient.println("GET /kahvi/update.php?weight=" + String(weight) + "&temp=" + String(temp) +  " HTTP/1.0"); //TODO: Change address type?
+      wwwclient.println("GET /kahvi/update.php?cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + " HTTP/1.0");
+      wwwclient.println("Host: " + String(wwwserver));
       wwwclient.println();
       unsigned long starttime = millis();
-      while (millis() - starttime < 5000)
+      while (millis() - starttime < 2000)
       {
         if (wwwclient.available()) {
           String line = wwwclient.readStringUntil('\r');
@@ -144,38 +158,53 @@ void updateValuesToServer(){
         }
       }
     }
-    //Clear flag
-    updateNeeded = false;
 }
 
 //Processes all incoming messages
 void processLine(String line){
-    
+    line.trim(); //Ensure that we have no extra whitespaces
+        
     if(line.startsWith("PING")){
       line[1] = 'O';
       client.println(line);
     }else if(line.indexOf("PRIVMSG") != -1){
-      int channelIdx = line.indexOf("PRIVMSG"); //Or actually this +8 chars
       int messageIdx = line.indexOf(':', 1)+1;
-      int channelIdxEnd = line.indexOf(' ', channelIdx+8);
-      int senderIdxEnd = line.indexOf('!');
+      String command = line.substring(messageIdx);
+      command.trim();
       
-      String channel = line.substring(channelIdx+8, channelIdxEnd);
-      String sender = line.substring(1, senderIdxEnd);
+      if(command[0] != '.') //Don't do extra work if the message isn't a command
+        return;
+
+      //Find indexes of various parts
+      int channelIdx = line.indexOf("PRIVMSG")+8;
+      int channelIdxEnd = line.indexOf(' ', channelIdx);
+      int senderIdxEnd = line.indexOf('!');
+
+      //Split original line to smaller strings
+      String channel = line.substring(channelIdx, channelIdxEnd);
+      String sender = line.substring(1, senderIdxEnd);   
+      
+      //If this is a query -> we need to answer to the sender
       if(channel[0] != '!' && channel[0] != '#') //Query
         channel = sender;
-      if(line.indexOf(".kello",messageIdx) != -1){
-        char timeNow[17];
-        sprintf(timeNow, "%04d-%02d-%02d %02d:%02d", year(), month(), day(), hour(), minute());
-        client.println("PRIVMSG " + channel + " :Aika on: " + timeNow);
-      }
-      else if(line.indexOf(".k",messageIdx) != -1 || line.indexOf(".kahvi",messageIdx) != -1 || line.indexOf(".coffee",messageIdx) != -1){
+
+      if(command == ".k" || command ==".kahvi" || command == ".coffee" || command == ".kaffe"){
         String tmp = "";
         if(!lastBrewTime)
           tmp = "Kahvia ei ole keitetty edellisen rebootin jälkeen.";
-        else
-          tmp = "Keitetty " + String((now()-lastBrewTime)/60) + " minuuttia sitten.";
+        else{
+          int minutes = (now()-lastBrewTime)/60;
+          tmp = "Keitetty " + (minutes > 59? String(minutes/60) + " tuntia sitten." : String(minutes) + " minuuttia sitten.");
+        }
         client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
+      }
+      else if(command == ".debug"){
+        debug = !debug;
+      }
+      else if(command == ".kello" || command == ".clock"){
+        char timeNow[17];
+        sprintf(timeNow, "%04d-%02d-%02d %02d:%02d", year(), month(), day(), hour(), minute());
+        client.println("PRIVMSG " + channel + " :Aika on: " + timeNow);
       }
     }
 }
@@ -228,14 +257,16 @@ boolean connect(){
   }
   client.println("USER " + nick + " 8 * : " + nick);
   client.println("JOIN " + defaultChannel);
+  client.println("JOIN " + debugChannel);
   return true;
 }
 
 
 
 //Function used to read 32bit number from serial stream
-int read32(){
-  int c = Serial.read();
+uint32_t read32(){
+  uint32_t c;
+  c = Serial.read();
   c |= Serial.read() << 8;
   c |= Serial.read() << 16;
   c |= Serial.read() << 24;
@@ -249,31 +280,23 @@ enum coffeeState {
 
 //Will be used for retrieving info from IO
 //TODO: Mapping to human readable values?
-char c,c1,c2;
+int c1,c2;
 void readSerial(){
-  while(Serial.available()){
-    c = Serial.read();
-    Serial.print(c);
+  while(Serial.available() > 14){
+    int c = Serial.read();
     if(c == 0xfe && c1 == 0xff && c2 == 0xff){
       buttons = Serial.read();
       weight = read32();
-      temp = read32();
-      if(temp <  300000 && state == IDLE){ //TODO: Adjust temperature limit (value gets smaller when higher temp)
+      temp = 21 - ((int)(read32()/ADC_DIVIDER-553))/2.15; //Very rough calibration using "elepaja standard temperature" = 27 Celcius
+      temp1 = read32();
+      if(temp >  70 && state == IDLE){
         client.println("PRIVMSG " + defaultChannel + " :Kahvi keittyy nyt!");
-        if(weight > minimumWeight*1.5) //We can presume that the coffee pot is at correct place at this stage
-          coffeePot = weight;
         state = BREWING;
-      }else if(temp > 320000 && state == BREWING){ //TODO: Adjust temperature limit (value gets bigger when lower temp)
+      }else if(temp < 55 && state == BREWING){
         client.println("PRIVMSG " + defaultChannel + " :Kahvi valmis!");
         lastBrewTime = now();
         state = IDLE;
       }
-      temp1 = read32();
-      
-      if(weight < minimumWeight)
-        minimumWeight = weight;
-      if(temp < maxTemp) //Max temp will be around 76-80 celcius -> this is used for calibration (we don't need exact temperature, value gets smaller when higher temp)
-        maxTemp = temp;
     }
     c2 = c1;
     c1 = c;
