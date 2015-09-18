@@ -122,17 +122,9 @@ void cupsUpdater(){
 void loop() {
   //Read IO data from serial
   readSerial();
-    
-  //If we havent connected and can't reconnect -> return
-  if (!client.connected() && !connect())
-    return;
-
-  //Process messages from irc server
-  while(client.available())
-    processLine(client.readStringUntil('\n'));
-
+  
   //If updateNeeded flag is set by Ticker -> we need to contact webserver
-  if(updateNeeded){
+  if(updateNeeded && WiFi.status() == WL_CONNECTED){
     if(debug)
       client.println("PRIVMSG " + debugChannel + " :Cups: " + String(cups) + " Weight: " + String(weight) + " Temp: " + String(temp) );
     #ifdef UPDATETOSERVER
@@ -140,19 +132,30 @@ void loop() {
     #endif
     updateNeeded = false;
   }
+  
+  //If we havent connected to irc and can't reconnect -> return
+  if (!client.connected() && !connect())
+    return;
+
+  //Process messages from irc server
+  while(client.available())
+    processLine(client.readStringUntil('\n')); //TODO: Remove "readstringuntil" -> replace with non-blocking code
+
+
 }
 
 //This function updates values to the server
 void updateValuesToServer(){
     if (wwwclient.connect(wwwserver, 80)) {
+      //TODO: Add salt
       wwwclient.println("GET /kahvi/update.php?cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + " HTTP/1.0");
       wwwclient.println("Host: " + String(wwwserver));
       wwwclient.println();
       unsigned long starttime = millis();
-      while (millis() - starttime < 2000)
+      while (millis() - starttime < 2000) //TODO: Don't wait here for response -> move this to main loop
       {
         if (wwwclient.available()) {
-          String line = wwwclient.readStringUntil('\r');
+          String line = wwwclient.readStringUntil('\r'); //TODO: Remove "readstringuntil" -> replace with non-blocking code
           if (line.indexOf("200 OK") != -1)
             break;
         }
