@@ -19,11 +19,10 @@
 #include <WiFiUdp.h>
 #include <Time.h>
 #include <Ticker.h>
-#include "sha256.h"
-#include "secret.h"
+#include "sha256.h" //HMAC-SHA256-functions
+#include "secret.h" //Contains #define SECRET "password".
 
 #define UPDATETOSERVER
-#define UPDATE_INTERVAL 5
 
 ADC_MODE(ADC_VCC);
 
@@ -36,7 +35,8 @@ IPAddress timeServer(193, 166, 5, 177); // time.nist.gov NTP server
 byte packetBuffer[NTP_PACKET_SIZE]; //48 = NTP packet size
 
 //WLAN SSID (and password)
-const char* ssid     = "aalto open";
+#define SSID "aalto open"
+//#define PASSWORD "wlanpassword"
 
 //IRC related variables
 const char* host = "irc.cs.hut.fi";
@@ -50,8 +50,8 @@ const char* wwwserver = "elepaja.aalto.fi";
 
 //Variables related to weight, calibration and etc.
 uint32_t rawTemp = 0,temp1 = 0, weight = 0, coffeePot = 413267;
-uint8_t buttons = 0, temp = 0;
-float cups = 0;
+uint8_t buttons = 0, updateInterval = 5;
+float cups = 0, temp = 0;
 volatile boolean updateNeeded = false;
 boolean debug = false;
 time_t lastBrewTime = 0;
@@ -73,26 +73,21 @@ void setup() {
   Serial.begin(9600);
   delay(10);
 
-  WiFi.begin(ssid);
-  
+#ifndef PASSWORD
+  WiFi.begin(SSID);
+#else
+  WiFi.begin(SSID,PASSWORD);
+#endif
+
   while (WiFi.status() != WL_CONNECTED) {
     delay(500);
   }
-
+  
   fetchTime();
   timeupdateTicker.attach(87600, fetchTime); //Update time every day
   
-  updatewwwTicker.attach(UPDATE_INTERVAL, requestUpdate);
   cupsTicker.attach(1, cupsUpdater);
 }
-
-//Ticker calls this function on 60 second intervals. Turns on updateNeeded flag which is checked at the end of the main loop.
-//Also writes EEPROM to flash from RAM
-void requestUpdate(){
-  updateNeeded = true;
-}
-
-
 
 //This function is called every second. It is used to check if amount of cups should be updated.
 void cupsUpdater(){
@@ -112,31 +107,34 @@ void cupsUpdater(){
   if(cupsCounter > 5){
     if(weight > 0.9*coffeePot) //coffeePot placed on the scale
       cups = ((int)(weight - coffeePot))/18263.0;
-    else if(cupsCounter > 180) //Pot was away over 180 seconds. Let's presume that it is too dirty to be used :P
+    else if(cupsCounter > 300) //Pot was away over 300 seconds. Let's presume that it is too dirty to be used :P
       cups = 0;
     if(cups < 0.5) //Small amounts are irrelevant :P -Temez
       cups = 0;
   }
+
+#ifdef UPDATETOSERVER
+  updateIntervalChecker();
+#endif
+
 }
 
 String ircstring = "";
 String wwwstring = "";
+unsigned long lastUpdate = millis();
 
 //Main loop. 
 void loop() {
   //Read IO data from serial
   readSerial();
-  
-  //If updateNeeded flag is set by Ticker -> we need to contact webserver
-  if(updateNeeded && WiFi.status() == WL_CONNECTED){
-    if(debug)
-      client.println("PRIVMSG " + debugChannel + " :Cups: " + String(cups) + " Weight: " + String(weight) + " Temp: " + String(temp) );
-    #ifdef UPDATETOSERVER
-      updateValuesToServer();
-    #endif
-    updateNeeded = false;
+
+#ifdef UPDATETOSERVER
+  if(millis()-lastUpdate > updateInterval*1000 && WiFi.status() == WL_CONNECTED){
+    updateValuesToServer();
+    lastUpdate = millis();
   }
-  
+#endif
+
   //If we havent connected and can't reconnect -> return
   if (!client.connected() && !connect())
     return;
@@ -165,7 +163,7 @@ void updateValuesToServer(){
     if (wwwclient.connect(wwwserver, 80) == 1) { // 1 = Success
       uint8_t *hash;
       Sha256.initHmac((uint8_t *)SECRET,strlen(SECRET));
-      String request = "cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + "&rawtemp=" + String(rawTemp) + "&vcc=" + String(ESP.getVcc());
+      String request = "timestamp=" + String(now()) + "&cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + "&rawtemp=" + String(rawTemp) + "&vcc=" + String(ESP.getVcc());
       Sha256.print(request);
       hash = Sha256.resultHmac();
       wwwclient.print("GET /kahvi/update.php?" + request + "&hash=");
@@ -177,6 +175,7 @@ void updateValuesToServer(){
       wwwclient.println("Host: " + String(wwwserver));
       wwwclient.println();
     }
+    //TODO: Save results to file system if no connection (and check that we really have new data to send?)
 }
 
 //Processes all incoming messages
@@ -208,19 +207,21 @@ void processLine(String line){
         channel = sender;
 
       if(command == ".k" || command ==".kahvi" || command == ".coffee" || command == ".kaffe"){
-        if(state = BREWING)
+        if(state == BREWING)
           client.println("PRIVMSG " + channel + " :Tuloillaan!");
         else{
           String tmp = "";
           if(lastBrewTime && cups > 0){
             int minutes = (now()-lastBrewTime)/60;
-            tmp = "Keitetty " + (minutes > 59? String(minutes/60) + " tuntia sitten." : String(minutes) + " minuuttia sitten.");
+            int hours = minutes/60;
+            tmp = "Keitetty " + (hours > 0? String(hours) + " h sitten." : String(minutes) + " min sitten.");
           }
           client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
         }
       }
-      else if(command == ".debug"){
+      else if(command == ".debug" && channel == debugChannel){
         debug = !debug;
+        client.println("PRIVMSG " + channel + " :Debug:" + String(debug));
       }
       else if(command == ".kello" || command == ".clock"){
         char timeNow[17];
@@ -255,6 +256,18 @@ void fetchTime(){
       break;
   }
   Udp.stop();
+}
+
+void updateIntervalChecker(){
+  time_t t = now();
+  //If debug is on -> send data every second
+  if(debug)
+    updateInterval = 1;
+  //measure often if one of the following is true a) temp is over 30 b) hour is between 7 and 20 c) coffee was brewed within 30 minutes
+  else if(temp > 30 || (hour(t) > 6  && hour(t) < 20) || t-lastBrewTime < 1800)
+    updateInterval = 5;
+  else
+    updateInterval = 60;  
 }
 
 //Connects to irc server
@@ -295,7 +308,6 @@ uint32_t read32(){
 }
 
 //Will be used for retrieving info from IO
-//TODO: Mapping to human readable values?
 int c1,c2;
 void readSerial(){
   while(Serial.available() > 14){
@@ -304,7 +316,7 @@ void readSerial(){
       buttons = Serial.read();
       weight = read32();
       rawTemp = read32();
-      temp = 21 - ((int)(rawTemp/ADC_DIVIDER-553))/2.15; //Very rough calibration
+      temp = 21 - ((int)(rawTemp-344519))/2.15/ADC_DIVIDER; //Very rough calibration
       temp1 = read32();
       if(temp >  70 && state == IDLE){
         client.println("PRIVMSG " + defaultChannel + " :Kahvi keittyy nyt!");
