@@ -19,16 +19,13 @@
 #include <WiFiUdp.h>
 #include <Time.h>
 #include <Ticker.h>
-#include <EEPROM.h>
+#include "sha256.h"
+#include "secret.h"
 
 #define UPDATETOSERVER
-#define UPDATE_INTERVAL 30
-//#define DEBUG
-
-
-#ifdef DEBUG
 #define UPDATE_INTERVAL 5
-#endif
+
+ADC_MODE(ADC_VCC);
 
 #define NTP_PORT 8888
 #define NTP_PACKET_SIZE 48
@@ -40,7 +37,6 @@ byte packetBuffer[NTP_PACKET_SIZE]; //48 = NTP packet size
 
 //WLAN SSID (and password)
 const char* ssid     = "aalto open";
-//const char* password = "sikelepaja";
 
 //IRC related variables
 const char* host = "irc.cs.hut.fi";
@@ -53,12 +49,16 @@ const int port = 6667;
 const char* wwwserver = "elepaja.aalto.fi"; 
 
 //Variables related to weight, calibration and etc.
-uint32_t temp1 = 0, weight = 0, coffeePot = 413267;
+uint32_t rawTemp = 0,temp1 = 0, weight = 0, coffeePot = 413267;
 uint8_t buttons = 0, temp = 0;
 float cups = 0;
 volatile boolean updateNeeded = false;
 boolean debug = false;
 time_t lastBrewTime = 0;
+enum coffeeState {
+  IDLE,
+  BREWING
+} state;
 
 WiFiUDP Udp;
 WiFiClient client;
@@ -66,6 +66,7 @@ WiFiClient wwwclient;
 Ticker timeupdateTicker;
 Ticker updatewwwTicker;
 Ticker cupsTicker;
+
 
 //Start Wlan connection and initialize Tickers
 void setup() {
@@ -118,6 +119,8 @@ void cupsUpdater(){
   }
 }
 
+String ircstring = "";
+
 //Main loop. 
 void loop() {
   //Read IO data from serial
@@ -128,9 +131,33 @@ void loop() {
     return;
 
   //Process messages from irc server
-  while(client.available())
-    processLine(client.readStringUntil('\n'));
+  while(client.available()){
+    char c = client.read();
+    if(c == '\n'){
+     processLine(ircstring);
+     ircstring = "";
+    }else
+     ircstring += c;
+  }
 
+  while(client.available()){
+    char c = client.read();
+    if(c == '\n'){
+     processLine(ircstring);
+     ircstring = "";
+    }else
+     ircstring += c;
+  }
+
+  while(wwwclient.available()){
+    char c = client.read();
+    if(c == '\n'){
+     processLine(ircstring);
+     ircstring = "";
+    }else
+     ircstring += c;
+  }
+  
   //If updateNeeded flag is set by Ticker -> we need to contact webserver
   if(updateNeeded){
     if(debug)
@@ -144,19 +171,20 @@ void loop() {
 
 //This function updates values to the server
 void updateValuesToServer(){
-    if (wwwclient.connect(wwwserver, 80)) {
-      wwwclient.println("GET /kahvi/update.php?cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + " HTTP/1.0");
+    if (wwwclient.connect(wwwserver, 80) == 1) { // 1 = Success
+      uint8_t *hash;
+      Sha256.initHmac((uint8_t *)SECRET,strlen(SECRET));
+      String request = "cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + "&rawtemp=" + String(rawTemp) + "&vcc=" + String(ESP.getVcc());
+      Sha256.print(request);
+      hash = Sha256.resultHmac();
+      wwwclient.print("GET /kahvi/update.php?" + request + "&hash=");
+      for (int i=0; i<32; i++) {
+        wwwclient.print("0123456789abcdef"[hash[i]>>4]);
+        wwwclient.print("0123456789abcdef"[hash[i]&0xf]);
+      }
+      wwwclient.println(" HTTP/1.0");
       wwwclient.println("Host: " + String(wwwserver));
       wwwclient.println();
-      unsigned long starttime = millis();
-      while (millis() - starttime < 2000)
-      {
-        if (wwwclient.available()) {
-          String line = wwwclient.readStringUntil('\r');
-          if (line.indexOf("200 OK") != -1)
-            break;
-        }
-      }
     }
 }
 
@@ -189,14 +217,16 @@ void processLine(String line){
         channel = sender;
 
       if(command == ".k" || command ==".kahvi" || command == ".coffee" || command == ".kaffe"){
-        String tmp = "";
-        if(!lastBrewTime)
-          tmp = "Kahvia ei ole keitetty edellisen rebootin jälkeen.";
+        if(state = BREWING)
+          client.println("PRIVMSG " + channel + " :Tuloillaan!");
         else{
-          int minutes = (now()-lastBrewTime)/60;
-          tmp = "Keitetty " + (minutes > 59? String(minutes/60) + " tuntia sitten." : String(minutes) + " minuuttia sitten.");
+          String tmp = "";
+          if(lastBrewTime && cups > 0){
+            int minutes = (now()-lastBrewTime)/60;
+            tmp = "Keitetty " + (minutes > 59? String(minutes/60) + " tuntia sitten." : String(minutes) + " minuuttia sitten.");
+          }
+          client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
         }
-        client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
       }
       else if(command == ".debug"){
         debug = !debug;
@@ -238,7 +268,7 @@ void fetchTime(){
 
 //Connects to irc server
 boolean connect(){
-  if (!client.connect(host, port))
+  if (client.connect(host, port) != 1) // 1 = Success
     return false;
 
   //Check that nick is not in use
@@ -273,11 +303,6 @@ uint32_t read32(){
   return c;
 }
 
-enum coffeeState {
-  IDLE,
-  BREWING
-} state;
-
 //Will be used for retrieving info from IO
 //TODO: Mapping to human readable values?
 int c1,c2;
@@ -287,7 +312,8 @@ void readSerial(){
     if(c == 0xfe && c1 == 0xff && c2 == 0xff){
       buttons = Serial.read();
       weight = read32();
-      temp = 21 - ((int)(read32()/ADC_DIVIDER-553))/2.15; //Very rough calibration using "elepaja standard temperature" = 27 Celcius
+      rawTemp = read32();
+      temp = 21 - ((int)(rawTemp/ADC_DIVIDER-553))/2.15; //Very rough calibration
       temp1 = read32();
       if(temp >  70 && state == IDLE){
         client.println("PRIVMSG " + defaultChannel + " :Kahvi keittyy nyt!");
