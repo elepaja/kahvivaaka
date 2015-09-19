@@ -120,12 +120,23 @@ void cupsUpdater(){
 }
 
 String ircstring = "";
+String wwwstring = "";
 
 //Main loop. 
 void loop() {
   //Read IO data from serial
   readSerial();
-    
+  
+  //If updateNeeded flag is set by Ticker -> we need to contact webserver
+  if(updateNeeded && WiFi.status() == WL_CONNECTED){
+    if(debug)
+      client.println("PRIVMSG " + debugChannel + " :Cups: " + String(cups) + " Weight: " + String(weight) + " Temp: " + String(temp) );
+    #ifdef UPDATETOSERVER
+      updateValuesToServer();
+    #endif
+    updateNeeded = false;
+  }
+  
   //If we havent connected and can't reconnect -> return
   if (!client.connected() && !connect())
     return;
@@ -140,32 +151,12 @@ void loop() {
      ircstring += c;
   }
 
-  while(client.available()){
-    char c = client.read();
-    if(c == '\n'){
-     processLine(ircstring);
-     ircstring = "";
-    }else
-     ircstring += c;
-  }
-
   while(wwwclient.available()){
-    char c = client.read();
-    if(c == '\n'){
-     processLine(ircstring);
-     ircstring = "";
+    char c = wwwclient.read();
+    if(wwwstring.endsWith("200 OK")){
+      wwwclient.stop();
     }else
-     ircstring += c;
-  }
-  
-  //If updateNeeded flag is set by Ticker -> we need to contact webserver
-  if(updateNeeded){
-    if(debug)
-      client.println("PRIVMSG " + debugChannel + " :Cups: " + String(cups) + " Weight: " + String(weight) + " Temp: " + String(temp) );
-    #ifdef UPDATETOSERVER
-      updateValuesToServer();
-    #endif
-    updateNeeded = false;
+     wwwstring += c;
   }
 }
 
