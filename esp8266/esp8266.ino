@@ -19,11 +19,14 @@
 #include <WiFiUdp.h>
 #include <Time.h>
 #include <Ticker.h>
+#include <EEPROM.h>
+#include "median.h"
 #include "sha256.h" //HMAC-SHA256-functions
 #include "secret.h" //Contains #define SECRET "password".
 
 #define UPDATETOSERVER
-
+#define MEDIAN_LENGTH 20
+#define MEDIAN_AVERAGE_N 5
 ADC_MODE(ADC_VCC);
 
 #define NTP_PORT 8888
@@ -31,47 +34,84 @@ ADC_MODE(ADC_VCC);
 #define BUTTON1_MASK 0b00000001 //PB0
 #define BUTTON2_MASK 0b00001000 //PB3
 #define ADC_DIVIDER 632
-IPAddress timeServer(193, 166, 5, 177); // time.nist.gov NTP server
+const IPAddress timeServer(193, 166, 5, 177); // time.nist.gov NTP server
 byte packetBuffer[NTP_PACKET_SIZE]; //48 = NTP packet size
 
 //WLAN SSID (and password)
 #define SSID "aalto open"
-//#define PASSWORD "wlanpassword"
+//#define PASSWORD "optional"
 
 //IRC related variables
 const char* host = "irc.cs.hut.fi";
 const String nick  = "CoffeeBot";
-const String defaultChannel = "#sik_ry";
+const String defaultChannel = "#coffeebot"; //"#sik_ry";
 const String debugChannel = "#coffeebot";
-String nickplus = "";
 const int port = 6667;
 
 const char* wwwserver = "elepaja.aalto.fi"; 
 
-//Variables related to weight, calibration and etc.
-uint32_t rawTemp = 0,temp1 = 0, weight = 0, coffeePot = 413267;
-uint8_t buttons = 0, updateInterval = 5;
-float cups = 0, temp = 0;
-volatile boolean updateNeeded = false;
-boolean debug = false;
+//Variables related to calibration and etc.
+uint32_t emptyScale = 0, coffeePot = 0;
+uint8_t buttons = 0;
+
+unsigned long lastWWWUpdate = 0;
+unsigned long weightChanged = 0;
 time_t lastBrewTime = 0;
+
 enum coffeeState {
   IDLE,
-  BREWING
-} state;
+  BREWING,
+  CALIBRATING_COFFEEPOT,
+  CALIBRATING_EMPTYSCALE,
+  WARMING,
+  COOLING
+};
+
+struct dataset {
+  int16_t weight;
+  uint32_t rawWeight;
+  float temp;
+  float cups;
+  uint32_t rawTemp;
+  uint32_t rawTemp1;
+  uint16_t espVCC;
+  uint32_t avrVCC;
+  coffeeState state;
+} ;
+
+dataset current;
+dataset previousUpdated;
+
+boolean debug = false;
+boolean reboot = true;
+
+FastRunningMedian<uint32_t, MEDIAN_LENGTH, 0> rawWeightMedian;
+FastRunningMedian<uint32_t, MEDIAN_LENGTH, 0> rawtempMedian;
+FastRunningMedian<uint32_t, MEDIAN_LENGTH, 0> rawTemp1Median;
+FastRunningMedian<uint32_t, MEDIAN_LENGTH, 0> coffeePotMedian;
+FastRunningMedian<uint32_t, MEDIAN_LENGTH, 0> emptyScaleMedian;
+
 
 WiFiUDP Udp;
 WiFiClient client;
 WiFiClient wwwclient;
 Ticker timeupdateTicker;
-Ticker updatewwwTicker;
-Ticker cupsTicker;
-
 
 //Start Wlan connection and initialize Tickers
 void setup() {
   Serial.begin(9600);
-  delay(10);
+  
+  EEPROM.begin(8);
+  for(int i = 0; i < 4; ++i){
+    coffeePot |= EEPROM.read(i) << i*8;
+    emptyScale |= EEPROM.read(4+i) << i*8;
+  }
+  
+  //Populate medians with values from EEPROM
+  for(int i = 0; i < MEDIAN_LENGTH; ++i)
+    coffeePotMedian.addValue(coffeePot);
+  for(int i = 0; i < MEDIAN_LENGTH; ++i)
+    emptyScaleMedian.addValue(emptyScale);
 
 #ifndef PASSWORD
   WiFi.begin(SSID);
@@ -79,93 +119,65 @@ void setup() {
   WiFi.begin(SSID,PASSWORD);
 #endif
 
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(500);
+  uint8_t i= 0;
+  while(i < MEDIAN_LENGTH*2){
+    i += readSerial();
+    yield();
   }
   
-  fetchTime();
-  timeupdateTicker.attach(87600, fetchTime); //Update time every day
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(100);
+  }
   
-  cupsTicker.attach(1, cupsUpdater);
+  maintenance();
+  timeupdateTicker.attach(87600, maintenance); //Update time every day
+
+  reboot = false;
 }
 
-//This function is called every second. It is used to check if amount of cups should be updated.
+//This function is used to check if amount of cups should be updated.
 void cupsUpdater(){
-  static uint16_t cupsCounter = 0; //How many seconds weight has been stable?
-  static uint32_t prevWeight = 0;
-  
-  //Value of weight must be 'stable' for 5 seconds
-  if(weight < prevWeight + 3600 && weight > prevWeight - 3600) // 3600 is about 25grams
-    cupsCounter++;
-  else{
-    cupsCounter = 0;
-    //Save weight for future usei 
-    prevWeight = weight;
+  // Weight has changed significantly?
+  if((current.weight > previousUpdated.weight + 15 || current.weight < previousUpdated.weight - 15) && millis()-weightChanged > 1000){
+    weightChanged = millis();
+    updateValuesToServer(current);
   }
   
-  //If the value of weight has been fairly stable during last 5 seconds
-  if(cupsCounter > 5){
-    if(weight > 0.9*coffeePot) //coffeePot placed on the scale
-      cups = ((int)(weight - coffeePot))/18263.0;
-    else if(cupsCounter > 300) //Pot was away over 300 seconds. Let's presume that it is too dirty to be used :P
-      cups = 0;
-    if(cups < 0.5) //Small amounts are irrelevant :P -Temez
-      cups = 0;
+  //If the value of weight has been fairly stable during last 4 seconds (notice ratelimit, which is 1s) -> update cups
+  if(millis()-weightChanged > 5000){
+    float tmp = current.weight/125.0;
+    if(current.weight > -200 && (tmp < previousUpdated.cups-0.1 || tmp > previousUpdated.cups+0.1)){ //coffeePot placed on the scale
+      if(tmp < 0.5)
+        current.cups = 0;
+      else
+        current.cups = tmp;
+      updateValuesToServer(current);
+    }
+    else if((current.weight <= -200 && current.cups != 0 && millis() - weightChanged > 300000)){ //Pot was away over 300 seconds. Let's presume that it is too dirty to be used :P
+      current.cups = 0;
+      updateValuesToServer(current);
+    }
   }
-
-#ifdef UPDATETOSERVER
-  updateIntervalChecker();
-#endif
-
 }
 
 String ircstring = "";
 String wwwstring = "";
-unsigned long lastUpdate = millis();
-
-//Main loop. 
-void loop() {
-  //Read IO data from serial
-  readSerial();
-
-#ifdef UPDATETOSERVER
-  if(millis()-lastUpdate > updateInterval*1000 && WiFi.status() == WL_CONNECTED){
-    updateValuesToServer();
-    lastUpdate = millis();
-  }
-#endif
-
-  //If we havent connected and can't reconnect -> return
-  if (!client.connected() && !connect())
-    return;
-
-  //Process messages from irc server
-  while(client.available()){
-    char c = client.read();
-    if(c == '\n'){
-     processLine(ircstring);
-     ircstring = "";
-    }else
-     ircstring += c;
-  }
-
-  while(wwwclient.available()){
-    char c = wwwclient.read();
-    if(wwwstring.endsWith("200 OK")){
-      wwwclient.stop();
-    }else
-     wwwstring += c;
-  }
-}
 
 //This function updates values to the server
-void updateValuesToServer(){
+void updateValuesToServer(struct dataset d){
+    previousUpdated = d;
+    if(WiFi.status() != WL_CONNECTED || d.state == CALIBRATING_COFFEEPOT || d.state == CALIBRATING_EMPTYSCALE) //Check that wifi is connected
+      return;
+    lastWWWUpdate = millis();
     if (wwwclient.connect(wwwserver, 80) == 1) { // 1 = Success
       uint8_t *hash;
       Sha256.initHmac((uint8_t *)SECRET,strlen(SECRET));
-      String request = "timestamp=" + String(now()) + "&cups=" + String(cups) + "&temp=" + String(temp) + "&weight=" + String(weight) + "&int_temp=" + String(temp1) + "&rawtemp=" + String(rawTemp) + "&vcc=" + String(ESP.getVcc());
+      String request = "timestamp=" + String(now()) + "&cups=" + String(d.cups) + "&temp=" + String(d.temp) + 
+                       "&weight=" + String(d.rawWeight) + "&weightgrams=" + String(d.weight) +
+                       "&int_temp=" + String(d.rawTemp1) + "&rawtemp=" + String(d.rawTemp) + "&espvcc=" + String(d.espVCC) + "&avrvcc=" + String(d.avrVCC);
       Sha256.print(request);
       hash = Sha256.resultHmac();
+
       wwwclient.print("GET /kahvi/update.php?" + request + "&hash=");
       for (int i=0; i<32; i++) {
         wwwclient.print("0123456789abcdef"[hash[i]>>4]);
@@ -176,6 +188,47 @@ void updateValuesToServer(){
       wwwclient.println();
     }
     //TODO: Save results to file system if no connection (and check that we really have new data to send?)
+}
+
+//Main loop. 
+void loop(){ 
+  //Read IO data from serial
+  readSerial();
+
+  yield(); //This yield migh be optional
+
+  //Check if amount of cups should be updated
+  cupsUpdater();
+
+  yield();
+  
+#ifdef UPDATETOSERVER
+  if((millis()-lastWWWUpdate > 8*60*1000) || ((debug || current.state != previousUpdated.state) && millis()-lastWWWUpdate > 5*1000))
+    updateValuesToServer(current); 
+  while(wwwclient.read() != -1)
+    yield();  
+  if (!wwwclient.connected())
+    wwwclient.stop();
+#endif
+
+  yield(); //This yield migh be optional
+  
+  //If we havent connected and can't reconnect -> return
+  if (!client.connected() && !connect())
+    return;
+
+  yield(); //This yield might be optional
+  
+  //Process messages from irc server
+  while(client.available()){
+    char c = client.read();
+    if(c == '\n'){
+     processLine(ircstring);
+     ircstring = "";
+    }else
+     ircstring += c;
+    yield();
+  }
 }
 
 //Processes all incoming messages
@@ -207,16 +260,18 @@ void processLine(String line){
         channel = sender;
 
       if(command == ".k" || command ==".kahvi" || command == ".coffee" || command == ".kaffe"){
-        if(state == BREWING)
+        if(current.state == BREWING)
           client.println("PRIVMSG " + channel + " :Tuloillaan!");
         else{
-          String tmp = "";
-          if(lastBrewTime && cups > 0){
+          String tmp = "Kahvia on " + String(current.cups) + " kuppia jäljellä.";
+          if(lastBrewTime && current.cups > 0){
             int minutes = (now()-lastBrewTime)/60;
             int hours = minutes/60;
-            tmp = "Keitetty " + (hours > 0? String(hours) + " h sitten." : String(minutes) + " min sitten.");
+            tmp += " Keitetty " + (hours > 0? String(hours) + " h sitten." : String(minutes) + " min sitten.");
+          }else if(current.cups == 0){
+            tmp = "Pannu on tyhjä :(";
           }
-          client.println("PRIVMSG " + channel + " :Kahvia on " + String(cups) + " kuppia jäljellä. " + tmp);
+          client.println("PRIVMSG " + channel + " :" + tmp);
         }
       }
       else if(command == ".debug" && channel == debugChannel){
@@ -224,21 +279,41 @@ void processLine(String line){
         client.println("PRIVMSG " + channel + " :Debug:" + String(debug));
       }
       else if(command == ".kello" || command == ".clock"){
-        char timeNow[17];
-        sprintf(timeNow, "%04d-%02d-%02d %02d:%02d", year(), month(), day(), hour(), minute());
+        char timeNow[24];
+        sprintf(timeNow, "%04d-%02d-%02d %02d:%02d:%02d UTC", year(), month(), day(), hour(), minute(), second());
         client.println("PRIVMSG " + channel + " :Aika on: " + timeNow);
+      }else if (command == ".calibrate" && channel == debugChannel){ 
+        if(current.state != CALIBRATING_EMPTYSCALE && current.state != CALIBRATING_COFFEEPOT && millis() < 30000){ //Implement some authentication, this is just temporary
+          current.state = CALIBRATING_EMPTYSCALE;
+          client.println("PRIVMSG " + debugChannel + " :Calibrating EMPTY Coffeepot");
+        }
+        else if(current.state == CALIBRATING_EMPTYSCALE){
+          current.state = CALIBRATING_COFFEEPOT;
+          client.println("PRIVMSG " + debugChannel + " :Calibrating FULL Coffeepot");
+        }
+        else if(current.state == CALIBRATING_COFFEEPOT){
+          current.state = IDLE;
+          client.println("PRIVMSG " + debugChannel + " :Calibration stopped!");
+        }
       }
     }
 }
 
-//Update time from NTP
-void fetchTime(){
+//Update time from NTP 
+void maintenance(){
+  if(!reboot){
+    for(int i = 0; i < 4; ++i){
+      EEPROM.write(i, (coffeePot >> 8*i) & 0xFF);
+      EEPROM.write(4+i, (emptyScale >> 8*i) & 0xFF);
+    }
+    EEPROM.commit();
+  }
   Udp.begin(NTP_PORT);
   sendNTPpacket(timeServer);
 
   unsigned long starttime = millis();
-  while (millis() - starttime < 10000) {
-    if ( Udp.parsePacket() ) {     // We've received a packet, read the data from it
+  while (millis() - starttime < 5000) {
+    if (Udp.parsePacket()) {     // We've received a packet, read the data from it
       Udp.read(packetBuffer, NTP_PACKET_SIZE); // read the packet into the buffer
       unsigned long highWord = word(packetBuffer[40], packetBuffer[41]);
       unsigned long lowWord = word(packetBuffer[42], packetBuffer[43]);
@@ -248,26 +323,15 @@ void fetchTime(){
       // Unix time starts on Jan 1 1970. In seconds, that's 2208988800:u
       const unsigned long seventyYears = 2208988800UL;
       unsigned long epoch = secsSince1900 - seventyYears;
-      unsigned long epochlocal = epoch + 7200;
-      if (IsDST(day(epochlocal), month(epochlocal), weekday(epochlocal))) epochlocal += 3600;
+      unsigned long epochlocal = epoch;
+      //if (IsDST(day(epochlocal), month(epochlocal), weekday(epochlocal))) epochlocal += 3600;
       setTime(epochlocal);
+      if (timeStatus() == timeSet)
+        break;
     }
-    if (timeStatus() == timeSet)
-      break;
+    yield(); //Allow wifi stack to run
   }
   Udp.stop();
-}
-
-void updateIntervalChecker(){
-  time_t t = now();
-  //If debug is on -> send data every second
-  if(debug)
-    updateInterval = 1;
-  //measure often if one of the following is true a) temp is over 30 b) hour is between 7 and 20 c) coffee was brewed within 30 minutes
-  else if(temp > 30 || (hour(t) > 6  && hour(t) < 20) || t-lastBrewTime < 1800)
-    updateInterval = 5;
-  else
-    updateInterval = 60;  
 }
 
 //Connects to irc server
@@ -277,7 +341,7 @@ boolean connect(){
 
   //Check that nick is not in use
   boolean nickOk = false;
-  nickplus = "";
+  String nickplus = "";
   while(!nickOk){
     client.println("NICK " + nick + nickplus);
     delay(1000);
@@ -299,7 +363,7 @@ boolean connect(){
 
 //Function used to read 32bit number from serial stream
 uint32_t read32(){
-  uint32_t c;
+  uint32_t c = 0;
   c = Serial.read();
   c |= Serial.read() << 8;
   c |= Serial.read() << 16;
@@ -308,32 +372,58 @@ uint32_t read32(){
 }
 
 //Will be used for retrieving info from IO
-int c1,c2;
-void readSerial(){
+int c1 = 0, c2 = 0;
+uint8_t readSerial(){
+  uint8_t count = 0;
   while(Serial.available() > 14){
     int c = Serial.read();
     if(c == 0xfe && c1 == 0xff && c2 == 0xff){
       buttons = Serial.read();
-      weight = read32();
-      rawTemp = read32();
-      temp = 21 - ((int)(rawTemp-344519))/2.15/ADC_DIVIDER; //Very rough calibration
-      temp1 = read32();
-      if(temp >  70 && state == IDLE){
-        client.println("PRIVMSG " + defaultChannel + " :Kahvi keittyy nyt!");
-        state = BREWING;
-      }else if(temp < 55 && state == BREWING){
-        client.println("PRIVMSG " + defaultChannel + " :Kahvi valmis!");
-        lastBrewTime = now();
-        state = IDLE;
+
+      rawWeightMedian.addValue(read32());
+      current.rawWeight = rawWeightMedian.getAverage(MEDIAN_AVERAGE_N);
+      current.weight = map(current.rawWeight,emptyScale,coffeePot+1,-815,0); //+1 to ensure that there is no division by zero if no previous
+
+      rawtempMedian.addValue(read32());
+      current.rawTemp = rawtempMedian.getAverage(MEDIAN_AVERAGE_N);
+      current.temp = 21 - ((int)(current.rawTemp-312980))*1100.0/1023/2.329568788501027/ADC_DIVIDER; //Very rough calibration
+
+      rawTemp1Median.addValue(read32());
+      current.rawTemp1 = rawTemp1Median.getAverage(MEDIAN_AVERAGE_N);
+
+      current.avrVCC = read32();
+      current.espVCC = ESP.getVcc();
+      if(!reboot){
+        if(current.temp > 60 && current.state != BREWING){
+          current.state = BREWING;
+        }else if(current.temp > 30 && current.state == IDLE){
+          coffeePotMedian.addValue(current.rawWeight);
+          coffeePot = coffeePotMedian.getAverage(MEDIAN_AVERAGE_N);
+          current.state = WARMING;
+        }else if(current.temp < 55 && current.state == BREWING){
+          client.println("PRIVMSG " + defaultChannel + " :Kahvi valmis!");
+          lastBrewTime = now();
+          current.state = COOLING;
+        }else if(current.state == CALIBRATING_EMPTYSCALE){
+          emptyScaleMedian.addValue(current.rawWeight);
+          emptyScale = emptyScaleMedian.getAverage(MEDIAN_AVERAGE_N);
+        }else if(current.state == CALIBRATING_COFFEEPOT){
+          coffeePotMedian.addValue(current.rawWeight);
+          coffeePot = coffeePotMedian.getAverage(MEDIAN_AVERAGE_N);
+        }else if (current.temp < 28)
+          current.state = IDLE;
       }
+      ++count;
     }
     c2 = c1;
     c1 = c;
+    yield();
   }
+  return count;
 }
 
 //Following two functions handle NTP and DST related things
-unsigned long sendNTPpacket(IPAddress& address)
+unsigned long sendNTPpacket(const IPAddress& address)
 {
   // set all bytes in the buffer to 0
   memset(packetBuffer, 0, NTP_PACKET_SIZE);
@@ -356,6 +446,7 @@ unsigned long sendNTPpacket(IPAddress& address)
   Udp.endPacket();
 }
 
+/*
 boolean IsDST(int day, int month, int dow)
 {
   if (month < 3 || month > 10) {
@@ -364,10 +455,10 @@ boolean IsDST(int day, int month, int dow)
   if (month > 3 && month < 10) {
     return true;
   }
-  int previousSunday = day - dow;
+  int previousUpdatedSunday = day - dow;
   if (month == 3) {
-    return previousSunday >= 24;
+    return previousUpdatedSunday >= 24;
   }
-  return previousSunday <= 24;
-}
+  return previousUpdatedSunday <= 24;
+}*/
 
